@@ -5,7 +5,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 
 **Họ tên / MSSV:** Trần Nguyễn Trí Dũng / 2A202602784
 **Repo:** https://github.com/bananayass/K4-Track02-Day17-TranNguyenTriDung-2A202602784-DataPipelineEngineering
-**Commit bài nộp:** 
+**Commit bài nộp:** b9e28a2d77ac121bff2eb8a59082af8625f1398b  và  48c9389fcfa9d8a919c88b9797f27235ac898f67
 **AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** Codex hỗ trợ trong việc đọc và giải thích code cũng như chỉ xem nên làm như thế nào
 **Nguồn tham khảo khác (nếu có):** README và tài liệu trong `docs/`.
 
