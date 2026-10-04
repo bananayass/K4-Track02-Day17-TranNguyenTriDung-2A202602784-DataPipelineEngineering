@@ -22,10 +22,9 @@ SOURCES = {
     "transcripts": "transcripts/{day}.json",   # hourly S3 dumps, merged per day
 }
 
-# How many days back every daily run recomputes gold_feature_daily.
-# Events are produced by our own apps and reach Kafka within seconds, so each
-# run only needs to recompute its own day.
-LOOKBACK_DAYS = 0
+# How many days back every daily run recomputes gold_feature_daily. The seed's
+# measured Bronze P99 lateness is 3 calendar days, so round up to 3 whole days.
+LOOKBACK_DAYS = 3
 
 EMBEDDING_MODEL_VERSION = "hash-embed-v1"
 CHUNK_WORDS = 40

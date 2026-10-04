@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256
 
 import duckdb
 
@@ -59,16 +60,26 @@ def estimate_tokens(texts: list[str]) -> int:
     return sum(len(PROMPT_TEMPLATE.format(text=t).split()) + 8 for t in texts)
 
 
-def parse_label(raw: str) -> str | None:
-    """Pull {"label": ...} out of the model's answer; None if it is not valid."""
-    m = re.search(r"\{.*\}", raw, flags=re.S)
-    if not m:
-        return None
+def validate_label_response(raw: str) -> tuple[str | None, str | None]:
+    """Validate the exact JSON schema expected from the model."""
     try:
-        label = json.loads(m.group(0)).get("label")
+        payload = json.loads(raw)
     except json.JSONDecodeError:
-        return None
-    return label if label in ALLOWED_LABELS else None
+        return None, "invalid_json"
+    if not isinstance(payload, dict) or set(payload) != {"label"}:
+        return None, "schema_mismatch"
+    label = payload["label"]
+    if not isinstance(label, str):
+        return None, "label_must_be_string"
+    if label not in ALLOWED_LABELS:
+        return None, "label_not_allowed"
+    return label, None
+
+
+def parse_label(raw: str) -> str | None:
+    """Return a label only when the response matches the complete schema."""
+    label, _ = validate_label_response(raw)
+    return label
 
 
 def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
@@ -80,14 +91,70 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     """).fetchall()
 
 
+def _input_hash(text: str) -> str:
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
+def _cache_key(input_hash: str, model: str, prompt_version: str) -> str:
+    material = "\0".join((input_hash, model, prompt_version))
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
+    """Cache versioned model responses; invalid output is quarantined, never Gold."""
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        cache_key VARCHAR PRIMARY KEY, input_hash VARCHAR NOT NULL,
+        model VARCHAR NOT NULL, prompt_version VARCHAR NOT NULL,
+        label VARCHAR, raw_response VARCHAR NOT NULL, validation_error VARCHAR)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_quarantine (
+        ticket_id VARCHAR, input_hash VARCHAR, model VARCHAR,
+        prompt_version VARCHAR, raw_response VARCHAR, reason VARCHAR)""")
+
+    cache = {
+        key: (label, raw, error)
+        for key, label, raw, error in con.execute(
+            """SELECT cache_key, label, raw_response, validation_error
+               FROM llm_label_cache WHERE model = ? AND prompt_version = ?""",
+            [llm.model, PROMPT_VERSION],
+        ).fetchall()
+    }
+    gold_rows = []
+    quarantine_rows = []
+    cache_hits = 0
+    calls_before = llm.calls
     for ticket_id, text in live_tickets(con):
-        raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+        input_hash = _input_hash(text)
+        key = _cache_key(input_hash, llm.model, PROMPT_VERSION)
+        if key in cache:
+            label, raw, error = cache[key]
+            cache_hits += 1
+        else:
+            raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
+            label, error = validate_label_response(raw)
+            con.execute(
+                """INSERT INTO llm_label_cache
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [key, input_hash, llm.model, PROMPT_VERSION, label, raw, error],
+            )
+            cache[key] = (label, raw, error)
+
+        if error is None:
+            gold_rows.append((ticket_id, label, llm.model, PROMPT_VERSION))
+        else:
+            quarantine_rows.append((ticket_id, input_hash, llm.model,
+                                    PROMPT_VERSION, raw, error))
+
+    # Each invocation publishes only this prompt version's valid current labels.
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
         ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+    if gold_rows:
+        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", gold_rows)
+
+    con.execute("DELETE FROM llm_label_quarantine WHERE model = ? AND prompt_version = ?",
+                [llm.model, PROMPT_VERSION])
+    if quarantine_rows:
+        con.executemany("INSERT INTO llm_label_quarantine VALUES (?, ?, ?, ?, ?, ?)",
+                        quarantine_rows)
+    return {"labeled": len(gold_rows), "calls": llm.calls,
+            "cache_hits": cache_hits, "quarantined": len(quarantine_rows),
+            "calls_this_run": llm.calls - calls_before}
